@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2024 Jani Nikula <jani@nikula.org>
+
+import argparse
+import collections
+import os
+import re
+import sys
+
+# https://peps.python.org/pep-0440/
+
+# [N!]N(.N)*[{a|b|rc}N][.postN][.devN]
+
+class VersionPart:
+    _seps = []
+
+    def __init__(s):
+        self._version = s
+
+    def __lt__(self, other):
+        return self._order < other._order
+
+    def __int__(self):
+        if self._version is None:
+            return 0
+
+        s = self._version.lstrip('0') or '0'
+
+        return int(s)
+
+    def present(self):
+        return self._version is not None
+
+    @classmethod
+    def bump_choices(cls):
+        return []
+
+    @classmethod
+    def bump_match(cls, what, sep=None):
+        if what.lower() not in cls.bump_choices():
+            return False
+
+        if sep is not None and sep not in cls._seps:
+            raise ValueError(f'separator {sep} not allowed for {what}')
+
+        return True
+
+    def bump(self, what, sep=None):
+        return False
+
+    def release(self):
+        return False
+
+    def reset(self):
+        pass
+
+class PrefixVersion(VersionPart):
+    _name = 'prefix'
+    _order = 0
+    _regex = r'(?P<prefix>[vV])?'
+
+    def __init__(self, mo):
+        self._version = mo.group('prefix')
+
+    def __repr__(self):
+        return f'{self._version}' if self.present() else ''
+
+    def normalized(self):
+        return ''
+
+class EpochVersion(VersionPart):
+    _name = 'epoch'
+    _order = 1
+    _regex = r'((?P<epoch>[0-9]+)(?P<epoch_sep>[!]))?'
+
+    def __init__(self, mo):
+        self._version = mo.group('epoch')
+        self._sep = mo.group('epoch_sep')
+
+    def __repr__(self):
+        return f'{self._version}{self._sep}' if self.present() else ''
+
+    def normalized(self):
+        return f'{int(self)}{self._sep}' if self.present() else ''
+
+class MajorVersion(VersionPart):
+    _name = 'major'
+    _order = 2
+    _regex = r'(?P<major>[0-9]+)'
+
+    def __init__(self, mo):
+        self._version = mo.group('major')
+
+    def __repr__(self):
+        return f'{self._version}'
+
+    def normalized(self):
+        return str(int(self))
+
+    @classmethod
+    def bump_choices(cls):
+        return [cls._name]
+
+    def bump(self, what, sep=None):
+        if not self.bump_match(what, sep):
+            return False
+
+        self._version = str(int(self) + 1)
+
+        return True
+
+class MinorVersion(VersionPart):
+    _name = 'minor'
+    _order = 3
+    _regex = r'((?P<minor_sep>[.])(?P<minor>[0-9]+))?'
+
+    def __init__(self, mo):
+        self._sep = mo.group('minor_sep')
+        self._version = mo.group('minor')
+
+    def reset(self):
+        if self.present():
+            self._version = '0'
+
+    def __repr__(self):
+        return f'{self._sep}{self._version}' if self.present() else ''
+
+    def normalized(self):
+        return f'{self._sep}{int(self)}' if self.present() else ''
+
+    @classmethod
+    def bump_choices(cls):
+        return [cls._name]
+
+    def bump(self, what, sep=None):
+        if not self.bump_match(what, sep):
+            return False
+
+        if not self.present():
+            raise ValueError('there is no minor version to bump')
+
+        self._version = str(int(self) + 1)
+
+        return True
+
+class PatchVersion(VersionPart):
+    _name = 'patch'
+    _order = 4
+    _regex = r'((?P<patch_sep>[.])(?P<patch>[0-9]+))?'
+
+    def __init__(self, mo):
+        self._sep = mo.group('patch_sep')
+        self._version = mo.group('patch')
+
+    def reset(self):
+        if self.present():
+            self._version = '0'
+
+    def __repr__(self):
+        return f'{self._sep}{self._version}' if self.present() else ''
+
+    def normalized(self):
+        return f'{self._sep}{int(self)}' if self.present() else ''
+
+    @classmethod
+    def bump_choices(cls):
+        return [cls._name, 'micro']
+
+    def bump(self, what, sep=None):
+        if not self.bump_match(what, sep):
+            return False
+
+        if not self.present():
+            raise ValueError('there is no micro/patch version to bump')
+
+        self._version = str(int(self) + 1)
+
+        return True
+
+class PreVersion(VersionPart):
+    _name = 'pre'
+    _order = 5
+    _regex = r'((?P<pre_sep>[._-])?((?P<pre>(a|b|rc|alpha|beta|c|pre|preview))(?P<pre_number>[0-9]+)?))?'
+    _seps = ['.', '_', '-']
+    _spellings = {
+        'a': 'a',
+        'b': 'b',
+        'rc': 'rc',
+        'alpha': 'a',
+        'beta': 'b',
+        'c': 'rc',
+        'pre': 'rc',
+        'preview': 'rc',
+    }
+
+    def __init__(self, mo):
+        self._sep = mo.group('pre_sep')
+        self._spelling = mo.group('pre')
+        self._version = mo.group('pre_number')
+
+    def reset(self):
+        self._sep = None
+        self._spelling = None
+        self._version = None
+
+    def present(self):
+        return self._spelling is not None
+
+    def __repr__(self):
+        if not self.present():
+            return ''
+
+        sep = self._sep or ''
+        ver = self._version if self._version is not None else ''
+
+        return f'{sep}{self._spelling}{ver}'
+
+    @classmethod
+    def _normalized_spelling(cls, spelling):
+        return cls._spellings[spelling.lower()]
+
+    def normalized(self):
+        if not self.present():
+            return ''
+
+        spelling = self._normalized_spelling(self._spelling)
+
+        ver = int(self) if self._version is not None else '0'
+
+        return f'{spelling}{ver}'
+
+    def release(self):
+        if not self.present():
+            return False
+
+        self.reset()
+        return True
+
+    @classmethod
+    def bump_choices(cls):
+        return [s for s in cls._spellings.keys()]
+
+    # Note: preversion is special. You can bump both the spelling a -> b -> rc
+    # and the number!
+    def bump(self, what, sep=None):
+        if not self.bump_match(what, sep):
+            return False
+
+        if self.present():
+            order = ['a', 'b', 'rc']
+            current = order.index(self._normalized_spelling(self._spelling))
+            new = order.index(self._normalized_spelling(what))
+
+            if new == current:
+                if sep is not None and sep != self._sep:
+                    raise ValueError('unable to change separator while bumping version')
+
+                self._version = str(int(self) + 1)
+                return True
+            elif new < current:
+                raise ValueError(f'trying to bump {self._spelling} down to {what}')
+
+        if sep:
+            self._sep = sep
+        self._spelling = what # FIXME
+        self._version = '0'
+
+        return True
+
+class PostVersion(VersionPart):
+    _name = 'post'
+    _order = 6
+    _regex = r'((?P<post_sep>[._-])?((?P<post>(post|rev|r))(?P<post_number>[0-9]+)?))?'
+    _seps = ['.', '_', '-']
+    _spellings = {
+        'post': 'post',
+        'rev': 'post',
+        'r': 'post',
+    }
+
+    def __init__(self, mo):
+        self._sep = mo.group('post_sep')
+        self._spelling = mo.group('post')
+        self._version = mo.group('post_number')
+
+    def reset(self):
+        self._sep = None
+        self._spelling = None
+        self._version = None
+
+    def present(self):
+        return self._spelling is not None
+
+    def __repr__(self):
+        if not self.present():
+            return ''
+
+        sep = self._sep or ''
+        ver = self._version if self._version is not None else ''
+
+        return f'{sep}{self._spelling}{ver}'
+
+    def normalized(self):
+        if not self.present():
+            return ''
+
+        spelling = self._spellings[self._spelling.lower()]
+
+        return f'.{spelling}{int(self)}'
+
+    @classmethod
+    def bump_choices(cls):
+        return [s for s in cls._spellings.keys()]
+
+    def bump(self, what, sep=None):
+        if not self.bump_match(what, sep):
+            return False
+
+        if self.present():
+            self._version = str(int(self) + 1)
+        else:
+            if sep:
+                self._sep = sep
+            self._spelling = what
+            self._version = '0'
+
+        return True
+
+class DevVersion(VersionPart):
+    _name = 'dev'
+    _order = 7
+    _regex = r'((?P<dev_sep>[._-])?((?P<dev>dev)(?P<dev_number>[0-9]+)?))?'
+    _seps = ['.', '_', '-']
+
+    def __init__(self, mo):
+        self._sep = mo.group('dev_sep')
+        self._spelling = mo.group('dev')
+        self._version = mo.group('dev_number')
+
+    def reset(self):
+        self._sep = None
+        self._spelling = None
+        self._version = None
+
+    def present(self):
+        return self._spelling is not None
+
+    def __repr__(self):
+        if not self.present():
+            return ''
+
+        sep = self._sep or ''
+        ver = self._version if self._version is not None else ''
+
+        return f'{sep}{self._spelling}{ver}'
+
+    def normalized(self):
+        if not self.present():
+            return ''
+
+        return f'.{self._spelling.lower()}{int(self)}'
+
+    def release(self):
+        if not self.present():
+            return False
+
+        self.reset()
+        return True
+
+    @classmethod
+    def bump_choices(cls):
+        return [cls._name]
+
+    def bump(self, what, sep=None):
+        if not self.bump_match(what, sep):
+            return False
+
+        if self.present():
+            self._version = str(int(self) + 1)
+        else:
+            if sep:
+                self._sep = sep
+            self._spelling = what
+            self._version = '0'
+
+        return True
+
+class LocalVersion(VersionPart):
+    _name = 'local'
+    _order = 8
+    _regex = r'((?P<local_sep>[+])(?P<local>[A-Za-z0-9._-]+))?'
+
+    def __init__(self, mo):
+        self._sep = mo.group('local_sep')
+        self._version = mo.group('local')
+
+    def reset(self):
+        self._sep = None
+        self._version = None
+
+    def __repr__(self):
+        return f'{self._sep}{self._version}' if self.present() else ''
+
+    def normalized(self):
+        if not self.present():
+            return ''
+
+        local = re.sub(r'[_-]', '.', self._version)
+
+        return f'{self._sep}{local}'
+
+class Version:
+    _parts = [
+        PrefixVersion,
+        EpochVersion,
+        MajorVersion,
+        MinorVersion,
+        PatchVersion,
+        PreVersion,
+        PostVersion,
+        DevVersion,
+        LocalVersion,
+    ]
+
+    def __init__(self, s):
+        self._version = self.parse(s)
+
+        if str(self) != s:
+            raise ValueError(f'internal error, {str(self)} != {s}')
+
+    def __str__(self):
+        return ''.join([str(p) for p in self._version])
+
+    def release(self):
+        for p in reversed(self._version):
+            if p.release():
+                return
+
+    @classmethod
+    def bump_choices(cls):
+        bumps = []
+        for c in cls._parts:
+            bumps.extend(c.bump_choices())
+
+        bumps.append('release')
+
+        return bumps
+
+    def bump(self, what, sep=None):
+        if what == 'release':
+            self.release()
+            return
+
+        reset = False
+        for p in self._version:
+            if reset:
+                p.reset()
+            elif p.bump(what=what, sep=sep):
+                reset = True
+
+        if not reset:
+            raise ValueError(f'nothing matched for bumping "{what}"')
+
+    def normalized(self):
+        return ''.join([p.normalized() for p in self._version])
+
+    def parse(self, s):
+        regex = ''.join([v._regex for v in sorted(self._parts, key=lambda v: v._order)])
+
+        mo = re.match(f'^{regex}$', s)
+        if not mo:
+            raise ValueError('could not parse version')
+
+        return [t(mo) for t in sorted(self._parts, key=lambda v: v._order)]
+
+def filename(filename):
+    if filename == '-' or os.path.isfile(filename):
+        return filename
+    raise ValueError
+
+class CaseInsensitiveList(collections.UserList):
+    def __contains__(self, s):
+        if s[0] in ['.', '_', '-']:
+            s = s[1:]
+
+        return s.lower() in map(str.lower, self.data)
+
+def main():
+    parser = argparse.ArgumentParser(description='''PEP-0440
+    (https://peps.python.org/pep-0440) version parser, bumper, and normalizer.''')
+
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--version', action='store',
+                       help='Specify version on the command-line.')
+    group.add_argument('--version-file', type=filename, action='store',
+                       help='Read version from the specified file, or - for stdin.')
+
+    parser.add_argument('--normalize', action='store_true',
+                        help='Print the version normalized.')
+
+    bump_choices = CaseInsensitiveList(Version.bump_choices())
+    parser.add_argument('--bump', action='append', choices=bump_choices,
+                        default=[],
+                        help='''The version part to bump.
+                        May be given multiple times.
+                        Prefix with ".", "_", or "-" to specify the separator, for parts that allow it.''')
+
+    args = parser.parse_args()
+
+    if args.version_file:
+        if args.version_file == '-':
+            version = sys.stdin.read()
+        else:
+            with open(args.version_file, 'r') as f:
+                version = f.read().strip()
+    else:
+        version = args.version
+
+    try:
+        v = Version(version)
+    except ValueError as e:
+        print(e)
+        sys.exit(1)
+
+    try:
+        for bump in args.bump:
+            sep = None
+            if bump[0] in ['.', '_', '-']:
+                sep = bump[0]
+                bump = bump[1:]
+
+            v.bump(bump, sep=sep)
+    except ValueError as e:
+        print(e)
+        sys.exit(2)
+
+    if args.normalize:
+        print(v.normalized())
+    else:
+        print(str(v))
+
+if __name__== '__main__':
+    main()
